@@ -81,6 +81,20 @@ class ReplayBuffer:
     def __len__(self):
         return len(self.buffer)
 
+class DynamicsModel(nn.Module):
+    def __init__(self, obs_dim, action_dim):
+        super(DynamicsModel, self).__init__()
+        self.fc1 = nn.Linear(obs_dim + action_dim, 256)
+        self.fc2 = nn.Linear(256, 256)
+        self.fc3 = nn.Linear(256, obs_dim)
+
+    def forward(self, obs, action):
+        x = torch.cat([obs, action], dim=-1)
+        x = F.relu(self.fc1(x))
+        x = F.relu(self.fc2(x))
+        return self.fc3(x)
+
+
 # Initialize networks and optimizers
 obs_dim = env.observation_space.shape[0]
 action_dim = 1
@@ -91,10 +105,12 @@ q_net1_target = QNetwork(obs_dim, action_dim)
 q_net2_target = QNetwork(obs_dim, action_dim)
 q_net1_target.load_state_dict(q_net1.state_dict())
 q_net2_target.load_state_dict(q_net2.state_dict())
+dynamics_model = DynamicsModel(obs_dim, action_dim)
 
 policy_optimizer = optim.Adam(policy_net.parameters(), lr=LR)
 q_optimizer1 = optim.Adam(q_net1.parameters(), lr=LR)
 q_optimizer2 = optim.Adam(q_net2.parameters(), lr=LR)
+dynamics_optimizer = optim.Adam(dynamics_model.parameters(), lr=LR)
 
 replay_buffer = ReplayBuffer(BUFFER_SIZE)
 
@@ -150,7 +166,16 @@ for episode in range(num_episodes):
 
             for target_param, param in zip(q_net2_target.parameters(), q_net2.parameters()):
                 target_param.data.copy_(TAU * param.data + (1 - TAU) * target_param.data)
-
+    # Train the dynamics model
+    for _ in range(100):
+        if len(replay_buffer) > BATCH_SIZE:
+            obs_batch, action_batch, _, next_obs_batch, _ = replay_buffer.sample(BATCH_SIZE)
+            pred_next_obs = dynamics_model(obs_batch, action_batch)
+            dynamics_loss = F.mse_loss(pred_next_obs, next_obs_batch)
+            dynamics_optimizer.zero_grad()
+            dynamics_loss.backward()
+            dynamics_optimizer.step
+            print(f"Dynamics Loss: {dynamics_loss.item()}")
     print(f"Episode {episode + 1}: Reward: {episode_reward}")
     
 
