@@ -6,6 +6,9 @@ import torch.nn.functional as F
 import numpy as np
 import random
 from collections import deque
+import pickle
+from dynamic_model import DynamicsModel
+from utils import ReplayBuffer
 
 # Set up the CartPole environment
 env = gym.make("CartPole-v1")
@@ -14,7 +17,9 @@ env = gym.make("CartPole-v1")
 GAMMA = 0.99
 TAU = 0.005
 LR = 3e-4
-BUFFER_SIZE = 100000
+# BUFFER_SIZE = 100000
+BUFFER_SIZE = 10000
+
 BATCH_SIZE = 256
 ALPHA = 0.2
 
@@ -59,40 +64,9 @@ class PolicyNetwork(nn.Module):
         log_prob = log_prob.sum(dim=-1, keepdim=True)
         return action, log_prob
 
-# Replay buffer for storing experience
-class ReplayBuffer:
-    def __init__(self, size):
-        self.buffer = deque(maxlen=size)
 
-    def add(self, transition):
-        self.buffer.append(transition)
 
-    def sample(self, batch_size):
-        transitions = random.sample(self.buffer, batch_size)
-        obs, action, reward, next_obs, done = zip(*transitions)
-        return (
-            torch.FloatTensor(obs),
-            torch.FloatTensor(action),
-            torch.FloatTensor(reward).unsqueeze(1),
-            torch.FloatTensor(next_obs),
-            torch.FloatTensor(done).unsqueeze(1),
-        )
 
-    def __len__(self):
-        return len(self.buffer)
-
-class DynamicsModel(nn.Module):
-    def __init__(self, obs_dim, action_dim):
-        super(DynamicsModel, self).__init__()
-        self.fc1 = nn.Linear(obs_dim + action_dim, 256)
-        self.fc2 = nn.Linear(256, 256)
-        self.fc3 = nn.Linear(256, obs_dim)
-
-    def forward(self, obs, action):
-        x = torch.cat([obs, action], dim=-1)
-        x = F.relu(self.fc1(x))
-        x = F.relu(self.fc2(x))
-        return self.fc3(x)
 
 
 # Initialize networks and optimizers
@@ -112,7 +86,7 @@ q_optimizer1 = optim.Adam(q_net1.parameters(), lr=LR)
 q_optimizer2 = optim.Adam(q_net2.parameters(), lr=LR)
 dynamics_optimizer = optim.Adam(dynamics_model.parameters(), lr=LR)
 
-replay_buffer = ReplayBuffer(BUFFER_SIZE)
+D_env = ReplayBuffer(BUFFER_SIZE)
 
 # Training loop
 num_episodes = 500
@@ -126,13 +100,19 @@ for episode in range(num_episodes):
         action, _ = policy_net.sample(obs_tensor)
         action = action.detach().cpu().numpy()[0]
         next_obs, reward, done, _ = env.step(int(action > 0))  # Convert action to list to match action space
-        replay_buffer.add((obs, action, reward, next_obs, float(done)))
+        D_env.add((obs, action, reward, next_obs, float(done)))
+        # if(len(D_env) >= BUFFER_SIZE):
+        #     # save replay buffer to file
+        #     with open('D_env.pkl', 'wb') as f:
+        #         pickle.dump(D_env, f)
+        #         raise Exception("Replay buffer saved")
+
         obs = next_obs
         episode_reward += reward
 
         # Update networks
-        if len(replay_buffer) > BATCH_SIZE:
-            obs_batch, action_batch, reward_batch, next_obs_batch, done_batch = replay_buffer.sample(BATCH_SIZE)
+        if len(D_env) > BATCH_SIZE:
+            obs_batch, action_batch, reward_batch, next_obs_batch, done_batch = D_env.sample(BATCH_SIZE)
 
             # Update Q networks
             with torch.no_grad():
@@ -167,16 +147,21 @@ for episode in range(num_episodes):
             for target_param, param in zip(q_net2_target.parameters(), q_net2.parameters()):
                 target_param.data.copy_(TAU * param.data + (1 - TAU) * target_param.data)
     # Train the dynamics model
-    for _ in range(100):
-        if len(replay_buffer) > BATCH_SIZE:
-            obs_batch, action_batch, _, next_obs_batch, _ = replay_buffer.sample(BATCH_SIZE)
+    agg_loss = 0
+    no_batches = 25
+    for _ in range(no_batches):
+        if len(D_env) > BATCH_SIZE:
+            obs_batch, action_batch, _, next_obs_batch, _ = D_env.sample(BATCH_SIZE)
             pred_next_obs = dynamics_model(obs_batch, action_batch)
-            dynamics_loss = F.mse_loss(pred_next_obs, next_obs_batch)
+            dynamics_loss = F.mse_loss(pred_next_obs, obs_batch-next_obs_batch)
             dynamics_optimizer.zero_grad()
             dynamics_loss.backward()
             dynamics_optimizer.step
-            print(f"Dynamics Loss: {dynamics_loss.item()}")
+            agg_loss += dynamics_loss.item()
+            # print(f"Dynamics Loss: {dynamics_loss.item()}")
+    agg_loss /= no_batches
     print(f"Episode {episode + 1}: Reward: {episode_reward}")
-    
+    print(f"replay buffer size: {len(D_env)}")
+    print(f"agg_loss: {agg_loss}")
 
 env.close()

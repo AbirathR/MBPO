@@ -14,6 +14,7 @@ env = gym.make("CartPole-v1")
 GAMMA = 0.99
 TAU = 0.005
 LR = 3e-4
+DM_LR = 1e-4
 BUFFER_SIZE = 100000
 BATCH_SIZE = 256
 ALPHA = 0.2
@@ -109,11 +110,13 @@ q_net2_target = QNetwork(obs_dim, action_dim)
 q_net1_target.load_state_dict(q_net1.state_dict())
 q_net2_target.load_state_dict(q_net2.state_dict())
 dynamics_model = DynamicsModel(obs_dim, action_dim)
+# load model
+dynamics_model.load_state_dict(torch.load('dynamics_model.pth'))
 
 policy_optimizer = optim.Adam(policy_net.parameters(), lr=LR)
 q_optimizer1 = optim.Adam(q_net1.parameters(), lr=LR)
 q_optimizer2 = optim.Adam(q_net2.parameters(), lr=LR)
-dynamics_optimizer = optim.Adam(dynamics_model.parameters(), lr=LR)
+dynamics_optimizer = optim.Adam(dynamics_model.parameters(), lr=DM_LR)
 
 replay_buffer_env = ReplayBuffer(BUFFER_SIZE)
 replay_buffer_model = ReplayBuffer(BUFFER_SIZE)
