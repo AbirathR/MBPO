@@ -17,52 +17,45 @@ E = 1000   # Environment steps per epoch
 M = 400    # Model rollouts per epoch
 B = 1      # Ensemble size (not used as ensemble size is 1)
 G = 40     # Policy updates per epoch
-k = 0      # Model horizon
-hidden_size = 200  # Hidden layer size
-num_hidden_layers = 4  # Number of hidden layers
+k = 1      # Model horizon
+hidden_size = 128  # Hidden layer size
+learning_rate = 1e-2
+
+gamma = 0.99  # Discount factor
 
 # Dynamics Model
 class DynamicsModel(nn.Module):
     def __init__(self, state_dim, action_dim):
         super(DynamicsModel, self).__init__()
-        layers = [nn.Linear(state_dim + action_dim, hidden_size), nn.ReLU()]
-        for _ in range(num_hidden_layers - 1):
-            layers += [nn.Linear(hidden_size, hidden_size), nn.ReLU()]
-        layers.append(nn.Linear(hidden_size, state_dim))
-        self.model = nn.Sequential(*layers)
+        self.state_space = state_dim
+        self.action_space = action_dim
+        self.l1 = nn.Linear(self.state_space + 1, 128, bias=False)
+        self.l2 = nn.Linear(128, 128, bias=False)
+        self.l3 = nn.Linear(128, self.state_space, bias=False)
 
     def forward(self, state, action):
+        action = action.view(-1, 1)  # Ensure action has the correct shape
         x = torch.cat([state, action], dim=1)
-        next_state = self.model(x)
+        x = torch.relu(self.l1(x))
+        x = torch.dropout(x, p=0.6, train=True)
+        next_state = self.l3(x)
         return next_state
 
-# Policy Network (Actor)
+# Policy Network
 class PolicyNetwork(nn.Module):
     def __init__(self, state_dim, action_dim):
         super(PolicyNetwork, self).__init__()
-        layers = [nn.Linear(state_dim, hidden_size), nn.ReLU()]
-        for _ in range(num_hidden_layers - 1):
-            layers += [nn.Linear(hidden_size, hidden_size), nn.ReLU()]
-        layers += [nn.Linear(hidden_size, action_dim), nn.Tanh()]  # For continuous actions in [-1, 1]
-        self.model = nn.Sequential(*layers)
+        self.state_space = state_dim
+        self.action_space = action_dim
+        self.l1 = nn.Linear(self.state_space, 128, bias=False)
+        self.l2 = nn.Linear(128, 128, bias=False)
+        self.l3 = nn.Linear(128, self.action_space, bias=False)
 
-    def forward(self, state):
-        action = self.model(state)
+    def forward(self, x):
+        x = torch.relu(self.l1(x))
+        x = torch.dropout(x, p=0.6, train=True)
+        action = torch.softmax(self.l3(x), dim=-1)
         return action
-
-# Value Network (Critic)
-class ValueNetwork(nn.Module):
-    def __init__(self, state_dim):
-        super(ValueNetwork, self).__init__()
-        layers = [nn.Linear(state_dim, hidden_size), nn.ReLU()]
-        for _ in range(num_hidden_layers - 1):
-            layers += [nn.Linear(hidden_size, hidden_size), nn.ReLU()]
-        layers.append(nn.Linear(hidden_size, 1))
-        self.model = nn.Sequential(*layers)
-
-    def forward(self, state):
-        value = self.model(state)
-        return value
 
 # Replay Buffer
 class ReplayBuffer:
@@ -85,17 +78,15 @@ class ReplayBuffer:
 env = gym.make('CartPole-v1')
 
 state_dim = env.observation_space.shape[0]
-action_dim = 1  # We'll discretize actions for CartPole
+action_dim = env.action_space.n
 
 # Initialize models
 dynamics_model = DynamicsModel(state_dim, action_dim)
 policy_net = PolicyNetwork(state_dim, action_dim)
-value_net = ValueNetwork(state_dim)
 
 # Optimizers
-dynamics_optimizer = optim.Adam(dynamics_model.parameters(), lr=1e-3)
-policy_optimizer = optim.Adam(policy_net.parameters(), lr=1e-3)
-value_optimizer = optim.Adam(value_net.parameters(), lr=1e-3)
+dynamics_optimizer = optim.Adam(dynamics_model.parameters(), lr=learning_rate)
+policy_optimizer = optim.Adam(policy_net.parameters(), lr=learning_rate)
 
 # Replay buffers
 real_buffer = ReplayBuffer()
@@ -103,6 +94,11 @@ model_buffer = ReplayBuffer()
 
 num_epochs = 1000
 
+# Policy history and reward history for policy gradient
+policy_history = []
+reward_episode = []
+
+# Training Loop
 episode_rewards = []
 
 for epoch in range(num_epochs):
@@ -111,17 +107,18 @@ for epoch in range(num_epochs):
     epoch_rewards = []
     while total_env_steps < E:
         state = env.reset()
-        # print("state:", state)
         done = False
         episode_reward = 0
         while not done and total_env_steps < E:
             state_tensor = torch.FloatTensor(state).unsqueeze(0)
-            action = policy_net(state_tensor).detach().numpy()[0]
-            # For CartPole, actions are discrete (0 or 1)
-            action = 0 if action < 0 else 1
+            action_probs = policy_net(state_tensor)
+            action_distribution = torch.distributions.Categorical(action_probs)
+            action = action_distribution.sample().item()
 
             next_state, reward, done, _ = env.step(action)
             real_buffer.push(state, [action], reward, next_state, done)
+            reward_episode.append(reward)
+            policy_history.append(action_distribution.log_prob(torch.tensor(action)))
             episode_reward += reward
             total_env_steps += 1
 
@@ -136,7 +133,7 @@ for epoch in range(num_epochs):
         if len(real_buffer) >= dynamics_batch_size:
             states, actions, rewards, next_states, dones = real_buffer.sample(dynamics_batch_size)
             states = torch.FloatTensor(states)
-            actions = torch.FloatTensor(actions)
+            actions = torch.FloatTensor(actions).view(-1, 1)  # Adjust action dimensions to match the model input
             next_states = torch.FloatTensor(next_states)
 
             predicted_next_states = dynamics_model(states, actions)
@@ -155,6 +152,7 @@ for epoch in range(num_epochs):
         state = initial_states
         for _ in range(k):
             action = policy_net(state).detach()
+            action = torch.argmax(action, dim=1).view(-1, 1)  # Adjust action dimensions to match the model input
             next_state = dynamics_model(state, action).detach()
 
             # Placeholder rewards and dones
@@ -165,30 +163,32 @@ for epoch in range(num_epochs):
 
             state = next_state
 
-    # Train policy with synthetic data
-    policy_batch_size = 256
-    for _ in range(G):
-        if len(model_buffer) >= policy_batch_size:
-            states, actions, rewards, next_states, dones = model_buffer.sample(policy_batch_size)
-            states = torch.FloatTensor(states)
-            actions = torch.FloatTensor(actions)
-            rewards = torch.FloatTensor(rewards)
-            next_states = torch.FloatTensor(next_states)
-            dones = torch.FloatTensor(dones)
+    # Update policy using policy gradient method
+    R = 0
+    rewards = []
+    # Discount future rewards back to the present using gamma
+    for r in reward_episode[::-1]:
+        R = r + gamma * R
+        rewards.insert(0, R)
 
-            # Update value network
-            target_values = rewards + 0.99 * value_net(next_states) * (1 - dones)
-            values = value_net(states)
-            value_loss = nn.MSELoss()(values, target_values.detach())
-            value_optimizer.zero_grad()
-            value_loss.backward()
-            value_optimizer.step()
+    # Scale rewards
+    rewards = torch.tensor(rewards)
+    rewards = (rewards - rewards.mean()) / (rewards.std() + np.finfo(np.float32).eps)
 
-            # Update policy network
-            policy_loss = -value_net(states).mean()
-            policy_optimizer.zero_grad()
-            policy_loss.backward()
-            policy_optimizer.step()
+    # Calculate policy gradient loss
+    policy_loss = []
+    for log_prob, reward in zip(policy_history, rewards):
+        policy_loss.append(-log_prob * reward)
+    policy_loss = torch.cat(policy_loss).sum()
+
+    # Update policy network
+    policy_optimizer.zero_grad()
+    policy_loss.backward()
+    policy_optimizer.step()
+
+    # Clear history
+    policy_history = []
+    reward_episode = []
 
     # Log progress
     avg_reward = np.mean(epoch_rewards)
@@ -204,6 +204,6 @@ plt.figure(figsize=(10, 5))
 plt.plot(episode_rewards)
 plt.xlabel('Epoch')
 plt.ylabel('Average Reward')
-plt.title('MBPO on CartPole-v1')
+plt.title('MBPO with Policy Gradient on CartPole-v1')
 plt.grid(True)
 plt.show()
