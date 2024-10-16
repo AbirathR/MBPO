@@ -1,209 +1,189 @@
 import gym
 import numpy as np
+import matplotlib.pyplot as plt
+from tqdm import tqdm
+import pandas as pd
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from collections import deque
-import random
-import matplotlib.pyplot as plt
+from torch.distributions import Categorical
+from tensorboardX import SummaryWriter
 
-# Set random seeds for reproducibility
-np.random.seed(42)
-torch.manual_seed(42)
-random.seed(42)
+# Set up environment and random seed
+env = gym.make('CartPole-v1')
+env.reset(seed=1)
+torch.manual_seed(1)
+writer = SummaryWriter('logfile/')
 
 # Hyperparameters
-E = 1000   # Environment steps per epoch
-M = 400    # Model rollouts per epoch
-B = 1      # Ensemble size (not used as ensemble size is 1)
-G = 40     # Policy updates per epoch
-k = 1      # Model horizon
-hidden_size = 128  # Hidden layer size
-learning_rate = 1e-2
+learning_rate = 0.01
+gamma = 0.99
+model_rollouts = 10
+k_step = 1
+use_only_D_env = True
 
-gamma = 0.99  # Discount factor
+# Define Policy Network
+class Policy(nn.Module):
+    def __init__(self):
+        super(Policy, self).__init__()
+        self.state_space = env.observation_space.shape[0]
+        self.action_space = env.action_space.n
 
-# Dynamics Model
-class DynamicsModel(nn.Module):
-    def __init__(self, state_dim, action_dim):
-        super(DynamicsModel, self).__init__()
-        self.state_space = state_dim
-        self.action_space = action_dim
-        self.l1 = nn.Linear(self.state_space + 1, 128, bias=False)
-        self.l2 = nn.Linear(128, 128, bias=False)
-        self.l3 = nn.Linear(128, self.state_space, bias=False)
-
-    def forward(self, state, action):
-        action = action.view(-1, 1)  # Ensure action has the correct shape
-        x = torch.cat([state, action], dim=1)
-        x = torch.relu(self.l1(x))
-        x = torch.dropout(x, p=0.6, train=True)
-        next_state = self.l3(x)
-        return next_state
-
-# Policy Network
-class PolicyNetwork(nn.Module):
-    def __init__(self, state_dim, action_dim):
-        super(PolicyNetwork, self).__init__()
-        self.state_space = state_dim
-        self.action_space = action_dim
         self.l1 = nn.Linear(self.state_space, 128, bias=False)
         self.l2 = nn.Linear(128, 128, bias=False)
         self.l3 = nn.Linear(128, self.action_space, bias=False)
 
     def forward(self, x):
+        # x = torch.relu(self.l1(x))
+        # x = torch.relu(self.l2(x))
+        # x = self.l3(x)
+        # return torch.softmax(x, dim=-1)
         x = torch.relu(self.l1(x))
         x = torch.dropout(x, p=0.6, train=True)
-        action = torch.softmax(self.l3(x), dim=-1)
-        return action
+        x = self.l3(x)
+        return torch.softmax(x, dim=-1)
 
-# Replay Buffer
-class ReplayBuffer:
-    def __init__(self, capacity=1000000):
-        self.buffer = deque(maxlen=capacity)
+# Define Predictive Model
+class PredictiveModel(nn.Module):
+    def __init__(self):
+        super(PredictiveModel, self).__init__()
+        self.state_space = env.observation_space.shape[0]
+        self.action_space = env.action_space.n
 
-    def push(self, state, action, reward, next_state, done):
-        self.buffer.append((state, action, reward, next_state, done))
+        self.l1 = nn.Linear(self.state_space + 1, 128)
+        self.l2 = nn.Linear(128, 128)
+        self.l3 = nn.Linear(128, self.state_space + 1)  # Predict next state and reward
 
-    def sample(self, batch_size):
-        samples = random.sample(self.buffer, batch_size)
-        states, actions, rewards, next_states, dones = zip(*samples)
-        return (np.array(states), np.array(actions), np.array(rewards),
-                np.array(next_states), np.array(dones))
+    def forward(self, state, action):
+        if action.dim() == 1:
+            action = action.unsqueeze(-1)  # Ensure action has batch dimension
+        if state.dim() == 1:
+            state = state.unsqueeze(0)  # Add batch dimension if missing
+        x = torch.cat((state, action), dim=-1)
+        x = torch.relu(self.l1(x))
+        x = torch.relu(self.l2(x))
+        x = self.l3(x)
+        next_state = x[:, :-1]
+        reward = x[:, -1]
+        return next_state, reward
 
-    def __len__(self):
-        return len(self.buffer)
+policy = Policy()
+predictive_model = PredictiveModel()
+optimizer_policy = optim.Adam(policy.parameters(), lr=learning_rate)
+optimizer_model = optim.Adam(predictive_model.parameters(), lr=learning_rate)
 
-# Training Loop
-env = gym.make('CartPole-v1')
+# Datasets to store environment and model data
+D_env = []
+D_model = []
 
-state_dim = env.observation_space.shape[0]
-action_dim = env.action_space.n
+# Select Action
+def select_action(state):
+    state = torch.from_numpy(state).float()
+    probs = policy(state)
+    c = Categorical(probs)
+    action = c.sample()
+    return action.item(), c.log_prob(action)
 
-# Initialize models
-dynamics_model = DynamicsModel(state_dim, action_dim)
-policy_net = PolicyNetwork(state_dim, action_dim)
+# Train Predictive Model
+def train_model():
+    if len(D_env) < 100:
+        return
+    batch = np.random.choice(len(D_env), 64)
+    states, actions, next_states, rewards = zip(*[D_env[i] for i in batch])
 
-# Optimizers
-dynamics_optimizer = optim.Adam(dynamics_model.parameters(), lr=learning_rate)
-policy_optimizer = optim.Adam(policy_net.parameters(), lr=learning_rate)
+    states = torch.tensor(np.array(states), dtype=torch.float32)
+    actions = torch.tensor(actions, dtype=torch.float32).unsqueeze(-1)
+    next_states = torch.tensor(np.array(next_states), dtype=torch.float32)
+    rewards = torch.tensor(rewards, dtype=torch.float32).unsqueeze(-1)
 
-# Replay buffers
-real_buffer = ReplayBuffer()
-model_buffer = ReplayBuffer()
+    pred_next_states, pred_rewards = predictive_model(states, actions)
+    loss = nn.MSELoss()(pred_next_states, next_states) + nn.MSELoss()(pred_rewards, rewards)
 
-num_epochs = 1000
+    optimizer_model.zero_grad()
+    loss.backward()
+    optimizer_model.step()
 
-# Policy history and reward history for policy gradient
-policy_history = []
-reward_episode = []
+# Update Policy
+def update_policy():
+    if(use_only_D_env):
+        
+        if len(D_env) < 100:
+            return
+        batch = np.random.choice(len(D_env[-100:]), 64)
+        states, actions, _,rewards = zip(*[D_env[i-100] for i in batch])
+    else:
+        if len(D_model) < 100:
+            return
+        batch = np.random.choice(len(D_model), 64)
+        states, actions, rewards = zip(*[D_model[i] for i in batch])
 
-# Training Loop
-episode_rewards = []
+    states = torch.tensor(np.array(states), dtype=torch.float32)
+    actions = torch.tensor(actions, dtype=torch.float32)
+    rewards = torch.tensor(rewards, dtype=torch.float32)
 
-for epoch in range(num_epochs):
-    # Collect E environment steps
-    total_env_steps = 0
-    epoch_rewards = []
-    while total_env_steps < E:
+    log_probs = []
+    for i in range(len(states)):
+        _, log_prob = select_action(states[i].numpy())
+        log_probs.append(log_prob)
+
+    loss = -torch.sum(torch.stack(log_probs) * rewards)
+
+    optimizer_policy.zero_grad()
+    loss.backward()
+    optimizer_policy.step()
+
+# Gather initial data with random policy
+state = env.reset()
+done = False
+while len(D_env) < 1000:
+    action = env.action_space.sample()
+    next_state, reward, done, _ = env.step(action)
+    D_env.append((state, action, next_state, reward))
+    state = next_state
+    if done:
+        state = env.reset()
+
+
+# Main Training Loop
+def main(epochs):
+    no_of_episodes = 0
+    for epoch in range(epochs):
+        # Train model on real environment data
+        train_model()
+
+        # Interact with the environment
         state = env.reset()
         done = False
-        episode_reward = 0
-        while not done and total_env_steps < E:
-            state_tensor = torch.FloatTensor(state).unsqueeze(0)
-            action_probs = policy_net(state_tensor)
-            action_distribution = torch.distributions.Categorical(action_probs)
-            action = action_distribution.sample().item()
-
+        while not done:
+            action, _ = select_action(state)
             next_state, reward, done, _ = env.step(action)
-            real_buffer.push(state, [action], reward, next_state, done)
-            reward_episode.append(reward)
-            policy_history.append(action_distribution.log_prob(torch.tensor(action)))
-            episode_reward += reward
-            total_env_steps += 1
-
+            # print("reward:", reward)
+            D_env.append((state, action, next_state, reward))
             state = next_state
+        no_of_episodes += 1
 
-        epoch_rewards.append(episode_reward)
+        # Model rollouts
+        for _ in range(model_rollouts):
+            state = np.array(D_env[np.random.choice(len(D_env))][0])
+            for _ in range(k_step):
+                action, _ = select_action(state)
+                action_tensor = torch.tensor([action], dtype=torch.float32).unsqueeze(0)
+                state_tensor = torch.tensor(state, dtype=torch.float32).unsqueeze(0)
+                next_state, reward = predictive_model(state_tensor, action_tensor)
+                D_model.append((state, action, reward.item()))
+                state = next_state.detach().numpy()[0]
 
-    # Train dynamics model with real data
-    dynamics_epochs = 50  # Number of epochs to train the dynamics model
-    dynamics_batch_size = 256
-    for _ in range(dynamics_epochs):
-        if len(real_buffer) >= dynamics_batch_size:
-            states, actions, rewards, next_states, dones = real_buffer.sample(dynamics_batch_size)
-            states = torch.FloatTensor(states)
-            actions = torch.FloatTensor(actions).view(-1, 1)  # Adjust action dimensions to match the model input
-            next_states = torch.FloatTensor(next_states)
+        # Update policy
+        update_policy()
 
-            predicted_next_states = dynamics_model(states, actions)
-            loss = nn.MSELoss()(predicted_next_states, next_states)
-            dynamics_optimizer.zero_grad()
-            loss.backward()
-            dynamics_optimizer.step()
+        # Log progress
+        if epoch % 10 == 0:
+            print(f'Epoch {epoch} completed')
+            print("D_env length:", len(D_env))
+            print(f"epoch avg reward: {np.sum([x[3] for x in D_env]) / no_of_episodes}")
 
-    # Generate synthetic data using the dynamics model
-    if len(real_buffer) >= M:
-        model_buffer = ReplayBuffer()  # Clear model buffer each epoch
-        # Sample M initial states from real buffer
-        initial_states, _, _, _, _ = real_buffer.sample(M)
-        initial_states = torch.FloatTensor(initial_states)
+# Run the training
+main(epochs=1000)
 
-        state = initial_states
-        for _ in range(k):
-            action = policy_net(state).detach()
-            action = torch.argmax(action, dim=1).view(-1, 1)  # Adjust action dimensions to match the model input
-            next_state = dynamics_model(state, action).detach()
-
-            # Placeholder rewards and dones
-            reward = torch.ones((M, 1))  # Assuming reward of 1 for CartPole
-            done = torch.zeros((M, 1))   # Assuming not done
-
-            model_buffer.push(state.numpy(), action.numpy(), reward.numpy(), next_state.numpy(), done.numpy())
-
-            state = next_state
-
-    # Update policy using policy gradient method
-    R = 0
-    rewards = []
-    # Discount future rewards back to the present using gamma
-    for r in reward_episode[::-1]:
-        R = r + gamma * R
-        rewards.insert(0, R)
-
-    # Scale rewards
-    rewards = torch.tensor(rewards)
-    rewards = (rewards - rewards.mean()) / (rewards.std() + np.finfo(np.float32).eps)
-
-    # Calculate policy gradient loss
-    policy_loss = []
-    for log_prob, reward in zip(policy_history, rewards):
-        policy_loss.append(-log_prob * reward)
-    policy_loss = torch.cat(policy_loss).sum()
-
-    # Update policy network
-    policy_optimizer.zero_grad()
-    policy_loss.backward()
-    policy_optimizer.step()
-
-    # Clear history
-    policy_history = []
-    reward_episode = []
-
-    # Log progress
-    avg_reward = np.mean(epoch_rewards)
-    episode_rewards.append(avg_reward)
-    if (epoch + 1) % 10 == 0:
-        print(f"Epoch {epoch + 1}, Average Reward: {avg_reward}")
-
-# Close the environment
-env.close()
-
-# Visualization of rewards
-plt.figure(figsize=(10, 5))
-plt.plot(episode_rewards)
-plt.xlabel('Epoch')
-plt.ylabel('Average Reward')
-plt.title('MBPO with Policy Gradient on CartPole-v1')
-plt.grid(True)
-plt.show()
+# Plot Results
+# (This part would require modifying to plot specific results from MDPO, e.g., model loss, reward history, etc.)
