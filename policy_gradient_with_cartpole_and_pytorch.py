@@ -11,6 +11,7 @@ from tensorboardX import SummaryWriter
 
 # Set up environment and random seed
 env = gym.make('CartPole-v1')
+print("action_space: ", env.action_space.shape)
 env.seed(1)
 torch.manual_seed(1)
 writer = SummaryWriter('logfile/')

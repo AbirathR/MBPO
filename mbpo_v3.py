@@ -106,12 +106,12 @@ def gather_env_data(env, policy, D_env):
     D_env.append(episode_data)
 
 
-def mbpo(episodes):
+def mbpo(epochs):
     policy = Policy()
     optimizer = optim.Adam(policy.parameters(), lr=learning_rate)
     D_env = []
     running_reward = 10
-    for episode in range(episodes):
+    for epoch in range(epochs):
         episode_data = EpisodeData()
         state = env.reset()
         done = False
@@ -128,7 +128,7 @@ def mbpo(episodes):
         # Used to determine when the environment is solved
         running_reward = (running_reward * 0.99) + (time * 0.01)
 
-        update_policy(episode, episode_data, policy.loss_history, policy.reward_history, optimizer)
+        update_policy(epoch, episode_data, policy.loss_history, policy.reward_history, optimizer)
         D_env.append(episode_data)
         # episode.policy_history = []
         # policy.reward_episode = []
